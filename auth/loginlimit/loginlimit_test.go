@@ -1,0 +1,96 @@
+package loginlimit
+
+import (
+	"fmt"
+	"testing"
+	"time"
+)
+
+type clock struct{ t time.Time }
+
+func (c *clock) now() time.Time          { return c.t }
+func (c *clock) add(d time.Duration)     { c.t = c.t.Add(d) }
+func newClock() *clock                   { return &clock{t: time.Unix(1_700_000_000, 0)} }
+func limiter(c *clock, max int) *Limiter { return New(Config{MaxFails: max, Now: c.now}) }
+
+func TestDefaults(t *testing.T) {
+	cfg := New(Config{}).Config()
+	if cfg.MaxFails != DefaultMaxFails || cfg.LockFor != DefaultLockFor || cfg.Window != DefaultWindow || cfg.Now == nil {
+		t.Errorf("defaults not applied: %+v", cfg)
+	}
+}
+
+func TestLocksAfterMaxFails(t *testing.T) {
+	c := newClock()
+	l := limiter(c, 8)
+	keys := []string{"ip:1.2.3.4", "user:DEMO"}
+	for i := 0; i < 7; i++ {
+		l.Fail(keys...)
+		if locked, _ := l.Locked(keys...); locked {
+			t.Fatalf("locked after %d failures, limit is 8", i+1)
+		}
+	}
+	l.Fail(keys...)
+	locked, left := l.Locked(keys...)
+	if !locked || left != DefaultLockFor {
+		t.Fatalf("locked=%v left=%v, want true %v", locked, left, DefaultLockFor)
+	}
+	c.add(DefaultLockFor)
+	if locked, _ := l.Locked(keys...); locked {
+		t.Error("lock must expire after LockFor")
+	}
+}
+
+func TestAnyKeyLocks(t *testing.T) {
+	c := newClock()
+	l := limiter(c, 3)
+	for i := 0; i < 3; i++ {
+		l.Fail("ip:9.9.9.9")
+	}
+	if locked, _ := l.Locked("ip:9.9.9.9", "user:OTHER"); !locked {
+		t.Error("a locked IP must block any account")
+	}
+	if locked, _ := l.Locked("ip:8.8.8.8", "user:OTHER"); locked {
+		t.Error("other IPs must not be affected")
+	}
+}
+
+func TestResetOnSuccess(t *testing.T) {
+	c := newClock()
+	l := limiter(c, 3)
+	l.Fail("k")
+	l.Fail("k")
+	l.Reset("k")
+	l.Fail("k")
+	if locked, _ := l.Locked("k"); locked {
+		t.Error("failures before Reset must not count")
+	}
+}
+
+func TestWindowExpires(t *testing.T) {
+	c := newClock()
+	l := limiter(c, 3)
+	l.Fail("k")
+	l.Fail("k")
+	c.add(DefaultWindow + time.Minute)
+	l.Fail("k")
+	if locked, _ := l.Locked("k"); locked {
+		t.Error("failures outside the window must not count")
+	}
+}
+
+func TestSweepDropsExpired(t *testing.T) {
+	c := newClock()
+	l := limiter(c, 3)
+	for i := 0; i < sweepAbove; i++ {
+		l.Fail(fmt.Sprintf("ip:%d", i))
+	}
+	c.add(DefaultWindow + time.Minute)
+	l.Fail("fresh")
+	l.mu.Lock()
+	n := len(l.m)
+	l.mu.Unlock()
+	if n != 1 {
+		t.Errorf("map holds %d entries after sweep, want 1", n)
+	}
+}
