@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -117,5 +118,18 @@ func TestClientIP(t *testing.T) {
 	r6.RemoteAddr = "[::1]:5555"
 	if got := ClientIP(r6, ClientIPOptions{TrustCloudflare: true}); got != "::1" {
 		t.Errorf("IPv6 peer: got %q, want ::1", got)
+	}
+}
+
+func TestVerifyErrorSaysWhy(t *testing.T) {
+	v := stub(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"success":false,"error-codes":["timeout-or-duplicate"]}`))
+	}, Options{})
+	err := v.Verify(context.Background(), "tok", "")
+	if !errors.Is(err, ErrFailed) {
+		t.Fatalf("err = %v, want ErrFailed", err)
+	}
+	if !strings.Contains(err.Error(), "timeout-or-duplicate") {
+		t.Errorf("err = %q, want Cloudflare's error code in the text", err)
 	}
 }

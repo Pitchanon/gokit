@@ -7,12 +7,18 @@
 // cannot be reached or answers with anything but success, Verify returns
 // ErrFailed. Failing open would let an attacker bypass the check by disrupting
 // the connection to Cloudflare.
+//
+// Every failure matches errors.Is(err, ErrFailed); the error text also says
+// why (Cloudflare's error codes, an HTTP status, a network error) so it can be
+// logged. Show users a fixed message, not err.Error().
 package turnstile
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -30,6 +36,15 @@ var (
 	// ErrNotConfigured means Verify was called on a Verifier with no secret.
 	ErrNotConfigured = errors.New("turnstile: no secret configured")
 )
+
+// maxResponse caps how much of Cloudflare's answer is read; a real one is a
+// few hundred bytes.
+const maxResponse = 64 << 10
+
+// fail wraps ErrFailed with the reason, for logs.
+func fail(format string, args ...any) error {
+	return fmt.Errorf("%w: "+format, append([]any{ErrFailed}, args...)...)
+}
 
 // Options tune a Verifier. The zero value is valid.
 type Options struct {
@@ -92,7 +107,7 @@ func (v *Verifier) Verify(ctx context.Context, token, remoteIP string) error {
 		return ErrNotConfigured
 	}
 	if strings.TrimSpace(token) == "" {
-		return ErrFailed
+		return fail("empty token")
 	}
 
 	form := url.Values{"secret": {v.secret}, "response": {token}}
@@ -102,25 +117,25 @@ func (v *Verifier) Verify(ctx context.Context, token, remoteIP string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.endpoint,
 		strings.NewReader(form.Encode()))
 	if err != nil {
-		return ErrFailed
+		return fail("build request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := v.client.Do(req)
 	if err != nil {
-		return ErrFailed
+		return fail("siteverify unreachable: %v", err)
 	}
 	defer resp.Body.Close()
 
 	var out verifyResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return ErrFailed
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponse)).Decode(&out); err != nil {
+		return fail("siteverify answered HTTP %d with an unreadable body: %v", resp.StatusCode, err)
 	}
 	if !out.Success {
-		return ErrFailed
+		return fail("rejected %v", out.ErrorCodes)
 	}
 	if v.hosts != nil && !v.hosts[strings.ToLower(out.Hostname)] {
-		return ErrFailed
+		return fail("token solved on unexpected hostname %q", out.Hostname)
 	}
 	return nil
 }

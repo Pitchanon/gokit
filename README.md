@@ -12,7 +12,7 @@ go get github.com/Pitchanon/gokit@latest
 | [`auth/pwhash`](auth/pwhash) | PBKDF2-HMAC-SHA256 password hashing with a self-describing format, so the cost can be raised later. |
 | [`auth/totp`](auth/totp) | TOTP codes (RFC 6238) for authenticator apps, with skew tolerance and `otpauth://` URIs for QR codes. |
 | [`auth/secretbox`](auth/secretbox) | AES-256-GCM encryption for stored TOTP secrets and HMAC digests for backup codes, keyed from one application secret. |
-| [`auth/loginlimit`](auth/loginlimit) | In-memory lockout after repeated failed logins, counted per key (IP, account, …). |
+| [`auth/loginlimit`](auth/loginlimit) | In-memory lockout after repeated failed logins, counted per key (IP, account, …), with `IPKey` to count an IPv6 /64 as one source. |
 | [`turnstile`](turnstile) | Server-side Cloudflare Turnstile verification that fails closed, plus a client-IP helper. |
 | [`thai`](thai) | Amounts in Thai words (`BahtText`) and Buddhist-era dates. |
 
@@ -23,7 +23,7 @@ hash, _ := pwhash.Hash(password)
 ok := pwhash.Verify(hash, attempt)
 
 lim := loginlimit.New(loginlimit.Config{MaxFails: 5})
-keys := []string{"ip:" + turnstile.ClientIP(r, turnstile.ClientIPOptions{}), "user:" + user}
+keys := []string{loginlimit.IPKey(turnstile.ClientIP(r, turnstile.ClientIPOptions{})), "user:" + user}
 if locked, wait := lim.Locked(keys...); locked {
 	// refuse, tell the user to retry after wait
 }
@@ -39,7 +39,11 @@ if locked, wait := lim.Locked(keys...); locked {
 - `auth/totp`: `Verify` does not prevent replay on its own. Store the returned
   counter and reject a counter that is not greater than the last one used.
 - `auth/loginlimit` keeps its counters in memory. Run one instance, or move the
-  state to shared storage.
+  state to shared storage. A restart forgets every counter and lock.
+- Count per-IP failures under `loginlimit.IPKey`, not the raw address: an IPv6
+  host normally owns a whole /64 and could pick a fresh address per attempt.
+- `turnstile.Verify` errors say why they failed (Cloudflare's error codes,
+  network errors) for your logs. Show users a fixed message instead.
 - `turnstile.ClientIP` trusts `CF-Connecting-IP` only with
   `TrustCloudflare: true`. Enable it only when the origin is reachable through
   Cloudflare alone; otherwise anyone can forge the header.

@@ -7,12 +7,18 @@
 //   - per client IP, to stop one source trying many accounts;
 //   - per account, to stop many sources (a botnet) trying one account.
 //
+// Count per-IP failures under IPKey(ip) rather than the raw address: one IPv6
+// host usually owns a whole /64 and could otherwise start afresh with every new
+// address it picks.
+//
 // State is kept in memory, which is right for a single server process. Behind
 // several instances each one keeps its own counters, multiplying an attacker's
 // budget by the instance count; move the state to shared storage in that case.
+// A restart also forgets every counter and lock.
 package loginlimit
 
 import (
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -36,9 +42,14 @@ const (
 	DefaultWindow   = 15 * time.Minute
 )
 
-// sweepAbove is the map size at which expired entries are dropped, so a flood
-// of distinct IPs cannot grow the map without bound.
-const sweepAbove = 1000
+// sweepAbove is the map size at which expired entries start being dropped.
+// sweepEvery spaces the sweeps out: a sweep walks the whole map, and while a
+// flood of distinct keys is still inside its window nothing can be dropped, so
+// sweeping on every Fail would cost O(n) per call for no gain.
+const (
+	sweepAbove = 1000
+	sweepEvery = time.Minute
+)
 
 type record struct {
 	count       int
@@ -48,9 +59,10 @@ type record struct {
 
 // Limiter counts failures per key. It is safe for concurrent use.
 type Limiter struct {
-	cfg Config
-	mu  sync.Mutex
-	m   map[string]*record
+	cfg       Config
+	mu        sync.Mutex
+	m         map[string]*record
+	lastSweep time.Time
 }
 
 // New returns a Limiter with cfg, filling in defaults.
@@ -73,17 +85,20 @@ func New(cfg Config) *Limiter {
 // Config returns the effective policy.
 func (l *Limiter) Config() Config { return l.cfg }
 
-// Locked reports whether any of keys is locked and, if so, the time left.
+// Locked reports whether any of keys is locked and, if so, the time left until
+// all of them are free again (the longest remaining lock), so a caller that
+// tells the user when to retry never names a time that is still locked.
 func (l *Limiter) Locked(keys ...string) (bool, time.Duration) {
 	now := l.cfg.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	var left time.Duration
 	for _, k := range keys {
 		if r := l.m[k]; r != nil && now.Before(r.lockedUntil) {
-			return true, r.lockedUntil.Sub(now)
+			left = max(left, r.lockedUntil.Sub(now))
 		}
 	}
-	return false, 0
+	return left > 0, left
 }
 
 // Failures returns the failures counted for key in its current window. It is
@@ -132,12 +147,30 @@ func (l *Limiter) Reset(keys ...string) {
 }
 
 func (l *Limiter) sweep(now time.Time) {
-	if len(l.m) < sweepAbove {
+	if len(l.m) < sweepAbove || now.Sub(l.lastSweep) < sweepEvery {
 		return
 	}
+	l.lastSweep = now
 	for k, r := range l.m {
 		if now.After(r.lockedUntil) && now.Sub(r.windowStart) > l.cfg.Window {
 			delete(l.m, k)
 		}
 	}
+}
+
+// IPKey returns the key to count an address under: "ip:" plus the address for
+// IPv4, or plus its /64 network for IPv6. IPv4-mapped IPv6 addresses
+// (::ffff:1.2.3.4) count as the IPv4 address. Text that does not parse as an
+// address is used as is, so a bad header cannot make keys collide with real
+// ones or with each other.
+func IPKey(ip string) string {
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		return "ip:" + ip
+	}
+	a = a.Unmap().WithZone("")
+	if a.Is4() {
+		return "ip:" + a.String()
+	}
+	return "ip:" + netip.PrefixFrom(a, 64).Masked().String()
 }

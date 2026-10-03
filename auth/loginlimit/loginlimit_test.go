@@ -117,3 +117,62 @@ func TestSweepDropsExpired(t *testing.T) {
 		t.Errorf("map holds %d entries after sweep, want 1", n)
 	}
 }
+
+func TestLockedReportsLongestWait(t *testing.T) {
+	c := newClock()
+	l := limiter(c, 1)
+	l.Fail("ip:1.2.3.4")
+	c.add(10 * time.Minute)
+	l.Fail("user:DEMO")
+	// The IP lock has 5 minutes left, the user lock 15; the user can only get
+	// in after the later one, whichever key is listed first.
+	for _, keys := range [][]string{{"ip:1.2.3.4", "user:DEMO"}, {"user:DEMO", "ip:1.2.3.4"}} {
+		if locked, left := l.Locked(keys...); !locked || left != DefaultLockFor {
+			t.Errorf("Locked(%v) = %v, %v; want true, %v", keys, locked, left, DefaultLockFor)
+		}
+	}
+}
+
+func TestSweepIsSpacedOut(t *testing.T) {
+	c := newClock()
+	l := limiter(c, 3)
+	for i := 0; i < sweepAbove; i++ {
+		l.Fail(fmt.Sprintf("ip:%d", i))
+	}
+	c.add(DefaultWindow - 10*time.Second)
+	l.Fail("first") // sweeps, but nothing has expired yet
+	c.add(20 * time.Second)
+	l.Fail("too-soon") // the 1000 have expired, but the last sweep was 20s ago
+	l.mu.Lock()
+	n := len(l.m)
+	l.mu.Unlock()
+	if n != sweepAbove+2 {
+		t.Fatalf("map holds %d entries, want %d (no sweep yet)", n, sweepAbove+2)
+	}
+	c.add(sweepEvery)
+	l.Fail("later")
+	l.mu.Lock()
+	n = len(l.m)
+	l.mu.Unlock()
+	if n != 3 {
+		t.Errorf("map holds %d entries after sweep, want 3", n)
+	}
+}
+
+func TestIPKey(t *testing.T) {
+	cases := map[string]string{
+		"1.2.3.4":                       "ip:1.2.3.4",
+		"::ffff:1.2.3.4":                "ip:1.2.3.4",
+		"2001:db8:1:2:aaaa:bbbb:cccc:d": "ip:2001:db8:1:2::/64",
+		"2001:db8:1:2::1":               "ip:2001:db8:1:2::/64",
+		"2001:db8:1:3::1":               "ip:2001:db8:1:3::/64",
+		"fe80::1%eth0":                  "ip:fe80::/64",
+		"not-an-ip":                     "ip:not-an-ip",
+		"":                              "ip:",
+	}
+	for in, want := range cases {
+		if got := IPKey(in); got != want {
+			t.Errorf("IPKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
