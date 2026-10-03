@@ -79,6 +79,29 @@ func TestWindowExpires(t *testing.T) {
 	}
 }
 
+func TestFailures(t *testing.T) {
+	c := newClock()
+	l := limiter(c, 3)
+	if n := l.Failures("k"); n != 0 {
+		t.Errorf("unknown key: %d", n)
+	}
+	l.Fail("k")
+	l.Fail("k")
+	if n := l.Failures("k"); n != 2 {
+		t.Errorf("after 2 failures: %d", n)
+	}
+	l.Fail("k") // third failure locks and restarts the count
+	if n := l.Failures("k"); n != 0 {
+		t.Errorf("after lock: %d", n)
+	}
+	l.Reset("k")
+	l.Fail("k")
+	c.add(DefaultWindow + time.Second)
+	if n := l.Failures("k"); n != 0 {
+		t.Errorf("after window: %d", n)
+	}
+}
+
 func TestSweepDropsExpired(t *testing.T) {
 	c := newClock()
 	l := limiter(c, 3)

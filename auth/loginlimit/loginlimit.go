@@ -86,6 +86,20 @@ func (l *Limiter) Locked(keys ...string) (bool, time.Duration) {
 	return false, 0
 }
 
+// Failures returns the failures counted for key in its current window. It is
+// 0 for an unknown key, after the window has passed, and right after a lock
+// starts (the count restarts once a key is locked).
+func (l *Limiter) Failures(key string) int {
+	now := l.cfg.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	r := l.m[key]
+	if r == nil || now.Sub(r.windowStart) > l.cfg.Window {
+		return 0
+	}
+	return r.count
+}
+
 // Fail records one failed attempt against every key.
 func (l *Limiter) Fail(keys ...string) {
 	now := l.cfg.Now()
